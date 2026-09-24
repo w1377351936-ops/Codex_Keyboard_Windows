@@ -21,7 +21,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Fast eval
-        run: ./scripts/eval-fast.sh
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/eval-fast.sh
 
   firmware:
     runs-on: ubuntu-latest

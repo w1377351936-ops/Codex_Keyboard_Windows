@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::fd::FromRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as ControlStream;
 #[cfg(unix)]
