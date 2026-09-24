@@ -1,0 +1,138 @@
+#![cfg(windows)]
+
+use std::collections::BTreeSet;
+use std::fs;
+
+use easy_codex_host::cache::{CacheBundle, CacheError, CacheId, CacheLimits, CacheStore};
+use easy_codex_host::codex_catalog::{CodexTask, CodexTaskCatalog};
+use easy_codex_host::paths::{AppPaths, open_private_file, replace_private_file};
+use easy_codex_host::rollout_observer::RolloutObserver;
+use easy_codex_host::secrets::{ImportLock, KeychainAccounts, LocalCacheSecretStore};
+use easy_codex_host::store::{NewJob, StateStore};
+use rusqlite::Connection;
+use serde_json::json;
+
+#[test]
+fn failed_codex_turn_does_not_block_later_authoritative_completion() {
+    const TASK: &str = "019fa972-5cfa-75e1-9008-0b17ade9a347";
+    const FAILED: &str = "019fa972-5cfa-75e1-9008-0b17ade9a348";
+    const SUCCEEDED: &str = "019fa972-5cfa-75e1-9008-0b17ade9a349";
+    let temporary = tempfile::tempdir().unwrap();
+    let rollout = temporary.path().join("rollout.jsonl");
+    let records = [
+        json!({"type":"session_meta","payload":{"id":TASK}}),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":FAILED}}),
+        json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":FAILED}}),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":SUCCEEDED}}),
+        json!({"type":"response_item","payload":{
+            "type":"message","role":"user",
+            "content":[{"type":"input_text","text":"please confirm"}],
+            "internal_chat_message_metadata_passthrough":{"turn_id":SUCCEEDED}
+        }}),
+        json!({"type":"event_msg","payload":{
+            "type":"task_complete","turn_id":SUCCEEDED,
+            "last_agent_message":"confirmed"
+        }}),
+    ];
+    let contents = records
+        .into_iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    fs::write(&rollout, contents).unwrap();
+    let task = CodexTask {
+        task_id: TASK.to_owned(),
+        name: "fixture".to_owned(),
+        project: "fixture".to_owned(),
+        cwd: temporary.path().to_path_buf(),
+        rollout_path: rollout.clone(),
+        updated_at_ms: 1,
+        pinned: false,
+    };
+    let catalog = CodexTaskCatalog::from_paths(
+        temporary.path().join("unused-codex"),
+        temporary.path().join("unused-snapshots"),
+    );
+    let state_path = temporary.path().join("state.sqlite3");
+    let mut store = StateStore::open(&state_path).unwrap();
+    let completions = RolloutObserver::new(catalog)
+        .poll_task(&mut store, &task)
+        .unwrap();
+    assert_eq!(completions.len(), 1);
+    let connection = Connection::open(state_path).unwrap();
+    let ids = connection
+        .prepare("SELECT completion_id FROM completion_ledger ORDER BY completion_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![SUCCEEDED]);
+    assert_eq!(store.rollout_cursor(TASK).unwrap().unwrap().offset, fs::metadata(rollout).unwrap().len());
+}
+
+#[test]
+fn windows_absolute_task_path_can_be_queued_and_read_back() {
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = AppPaths::from_root(temporary.path().join("private"));
+    paths.prepare().unwrap();
+    let cwd = temporary.path().join("task-one");
+    fs::create_dir(&cwd).unwrap();
+    let mut store = StateStore::open(&paths.state_database).unwrap();
+    store
+        .enqueue(&NewJob {
+            request_id: "capture-one",
+            task_id: "019fa972-5cfa-75e1-9008-0b17ade9a347",
+            slot: 1,
+            generation: 1,
+            prompt: "hello",
+            cwd: &cwd,
+        })
+        .unwrap();
+    let claimed = store.claim_next_runnable().unwrap().unwrap();
+    assert_eq!(claimed.cwd, cwd);
+    assert_eq!(claimed.prompt, "hello");
+}
+
+#[test]
+fn private_file_replacement_changes_handle_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = AppPaths::from_root(temporary.path().join("private"));
+    paths.prepare().unwrap();
+    let path = paths.root.join("value.bin");
+    replace_private_file(&path, b"first").unwrap();
+    let original = open_private_file(&path).unwrap();
+    assert!(easy_codex_host::windows_paths::same_file_handle(&original, &path).unwrap());
+    replace_private_file(&path, b"second").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"second");
+    assert!(!easy_codex_host::windows_paths::same_file_handle(&original, &path).unwrap());
+}
+
+#[test]
+fn encrypted_cache_publishes_reads_and_reconciles_generation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = AppPaths::from_root(temporary.path().join("private"));
+    paths.prepare().unwrap();
+    let import_lock = ImportLock::acquire(&paths.runtime_directory.join("key-import.lock")).unwrap();
+    let accounts = KeychainAccounts::load_or_create(&paths.installation_id, &import_lock).unwrap();
+    let secrets = LocalCacheSecretStore::new(paths.cache_secret.clone(), &accounts);
+    let cache = CacheStore::initialize(&paths.cache_directory, &secrets, &accounts, CacheLimits::default()).unwrap();
+    let id = CacheId::for_task("019fa972-5cfa-75e1-9008-0b17ade9a347", 1).unwrap();
+    let bundle = CacheBundle { manifest_json: b"{}", qwen_wav: b"wav", device_eiad: b"eiad" };
+    cache.publish(&id, bundle).unwrap();
+    let read = cache.read(&id).unwrap();
+    assert_eq!(read.manifest_json.as_slice(), bundle.manifest_json);
+    assert_eq!(read.qwen_wav.as_slice(), bundle.qwen_wav);
+    assert_eq!(read.device_eiad.as_slice(), bundle.device_eiad);
+    assert_eq!(cache.audit().unwrap().finalized_generations, 1);
+    let ciphertext_path = paths.cache_directory.join(id.reference()).join("qwen.wav.enc");
+    let mut ciphertext = fs::read(&ciphertext_path).unwrap();
+    *ciphertext.last_mut().unwrap() ^= 1;
+    fs::write(&ciphertext_path, &ciphertext).unwrap();
+    assert!(matches!(cache.read(&id), Err(CacheError::Corrupt)));
+    *ciphertext.last_mut().unwrap() ^= 1;
+    fs::write(&ciphertext_path, &ciphertext).unwrap();
+    let retained = BTreeSet::from([id.reference()]);
+    assert_eq!(cache.reconcile(&retained).unwrap().orphan_generations_removed, 0);
+    assert_eq!(cache.reconcile(&BTreeSet::new()).unwrap().orphan_generations_removed, 1);
+    assert!(matches!(cache.read(&id), Err(CacheError::MissingObject)));
+}
